@@ -1,36 +1,14 @@
 #!/usr/bin/env python3
 """
-My Pals Tutor Bot - Firebase Edition
-Telegram bot untuk P6 Singapore Curriculum dengan Firebase database
+My Pals Tutor Bot - Simple Version (No Firebase for now)
+Telegram bot untuk P6 Singapore Curriculum
 """
 
 import os
-import json
-import random
-from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from anthropic import Anthropic
-import firebase_admin
-from firebase_admin import credentials, db
 
-# ============================================
-# INITIALIZE FIREBASE
-# ============================================
-try:
-    cred = credentials.Certificate('firebase-credentials.json')
-    firebase_admin.initialize_app(cred, {
-        'databaseURL': 'https://mypalstutorbot-default-rtdb.asia-southeast1.firebasedatabase.app'
-    })
-    FIREBASE_ENABLED = True
-    print("✅ Firebase connected")
-except Exception as e:
-    print(f"⚠️ Firebase error: {e}")
-    FIREBASE_ENABLED = False
-
-# ============================================
-# ANTHROPIC CLIENT
-# ============================================
 client = Anthropic()
 user_convos = {}
 
@@ -53,79 +31,12 @@ WHEN EXPLAINING:
 - Step-by-step breakdown
 - Emojis to make fun
 
-When asked for questions, provide in this format:
-Q1. [Question text]
-A) Option
-B) Option
-C) Option
-D) Option
-Answer: [Letter]
-Explanation: [Why this is correct]
-
-ESSAY questions:
-EQ1. [Question text]
-Sample answer: [Guide]
-
 BE FLEXIBLE: Student can ask for:
 - "5 questions about fractions"
 - "10 ABCD only about ratio"
 - "3 easy + 2 medium about photosynthesis"
 - Etc - adapt to their request"""
 
-# ============================================
-# FIREBASE FUNCTIONS
-# ============================================
-def get_questions(subject, topic, difficulty, count=20):
-    """Get questions from Firebase"""
-    try:
-        path = f'/questions/{subject}/{topic}/{difficulty}'
-        ref = db.reference(path)
-        data = ref.get()
-        
-        if not data:
-            return None
-        
-        # Randomly select 'count' questions
-        all_qs = list(data.values())
-        selected = random.sample(all_qs, min(count, len(all_qs)))
-        return selected
-    except:
-        return None
-
-def save_score(user_id, subject, topic, score, max_score):
-    """Save quiz score to Firebase"""
-    try:
-        timestamp = datetime.now().isoformat()
-        path = f'/users/{user_id}/scores/{subject}_{topic}'
-        ref = db.reference(path)
-        
-        score_data = {
-            'score': score,
-            'max': max_score,
-            'percentage': (score/max_score)*100,
-            'timestamp': timestamp,
-            'stars': int((score/max_score)*15)  # Max 15 stars
-        }
-        
-        ref.push(score_data)
-        return score_data['stars']
-    except:
-        return 0
-
-def add_stars(user_id, stars):
-    """Add stars to user profile"""
-    try:
-        path = f'/users/{user_id}/stars'
-        ref = db.reference(path)
-        current = ref.get() or 0
-        ref.set(current + stars)
-        return current + stars
-    except:
-        return 0
-
-# ============================================
-# BOT HANDLERS
-# ============================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_convos[user_id] = []
@@ -143,9 +54,7 @@ Ask me anything:
 
 Commands:
 /help - Show this message
-/reset - Start new topic
-/score - View your score
-/badges - View achievements"""
+/reset - Start new topic"""
     
     await update.message.reply_text(msg)
 
@@ -156,29 +65,6 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_convos[user_id] = []
     await update.message.reply_text("✅ Conversation reset! Ask me a new topic.")
-
-async def score_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    try:
-        if FIREBASE_ENABLED:
-            stars_ref = db.reference(f'/users/{user_id}/stars')
-            stars = stars_ref.get() or 0
-            
-            level = "Bronze"
-            if stars >= 300:
-                level = "Platinum"
-            elif stars >= 100:
-                level = "Gold"
-            elif stars >= 50:
-                level = "Silver"
-            
-            msg = f"⭐ Your Score\n\nStars: {stars}\nLevel: {level}"
-        else:
-            msg = "Firebase offline - score tracking unavailable"
-    except:
-        msg = "Could not fetch score"
-    
-    await update.message.reply_text(msg)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -225,11 +111,10 @@ async def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(CommandHandler("score", score_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     print("🤖 Bot started!")
-    await app.run_polling(allowed_updates=update.ALL_TYPES, drop_pending_updates=True)
+    await app.run_polling(allowed_updates=None, drop_pending_updates=True)
 
 if __name__ == '__main__':
     import asyncio
