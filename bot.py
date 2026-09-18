@@ -20,11 +20,14 @@ from firebase_admin import credentials, db
 
 # Firebase
 try:
-    cred = credentials.Certificate(os.getenv('FIREBASE_CREDENTIALS_JSON', 'firebase-credentials.json'))
-    if not firebase_admin.get_app():
-        firebase_admin.initialize_app(cred, {
-            'databaseURL': 'https://mypalstutorbot-default-rtdb.asia-southeast1.firebasedatabase.app'
-        })
+    firebase_creds_env = os.getenv('FIREBASE_CREDENTIALS_JSON')
+    if firebase_creds_env:
+        cred = credentials.Certificate(json.loads(firebase_creds_env))
+    else:
+        cred = credentials.Certificate('firebase-credentials.json')
+    firebase_admin.initialize_app(cred, {
+        'databaseURL': 'https://mypalstutorbot-default-rtdb.asia-southeast1.firebasedatabase.app'
+    })
     FIREBASE_AVAILABLE = True
     print("✅ Firebase connected")
 except Exception as e:
