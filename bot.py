@@ -56,50 +56,136 @@ def get_student(user_id):
     return student_data[user_id]
 
 # ============================================
+# SUBJECT / TOPIC MAP (for flexible topic requests)
+# ============================================
+
+SUBJECT_MAP = {
+    'math': ['fractions', 'ratio', 'percentage', 'algebra', 'geometry', 'data', 'time'],
+    'science': ['photosynthesis', 'ecosystems', 'food_chain', 'digestion', 'reproduction', 'weather', 'forces', 'machines', 'electricity'],
+    'english': ['grammar', 'vocabulary', 'comprehension', 'tenses', 'punctuation'],
+    'indonesian': ['vocabulary', 'grammar', 'stories', 'poetry', 'spelling'],
+    'chinese': ['characters', 'vocabulary', 'grammar', 'radicals', 'listening'],
+}
+ALL_TOPIC_PAIRS = [(subject, topic) for subject, topics in SUBJECT_MAP.items() for topic in topics]
+
+def find_subject_for_topic(topic):
+    """Find which subject a bare topic name belongs to, e.g. 'fractions' -> 'math'"""
+    for subject, topics in SUBJECT_MAP.items():
+        if topic in topics:
+            return subject
+    return None
+
+def resolve_topics(spec_tokens):
+    """Turn a list of raw tokens (topic names and/or subject names, e.g. ['math'] or ['ratio','fraction'])
+    into a deduped list of (subject, topic) pairs to quiz on. Empty input -> one random topic."""
+    resolved = []
+    for tok in spec_tokens:
+        tok = tok.strip().lower()
+        if not tok:
+            continue
+        if tok in SUBJECT_MAP:
+            for t in SUBJECT_MAP[tok]:
+                resolved.append((tok, t))
+        else:
+            subj = find_subject_for_topic(tok)
+            resolved.append((subj or tok, tok))
+
+    if not resolved:
+        resolved = [random.choice(ALL_TOPIC_PAIRS)]
+
+    # dedupe, preserve order
+    seen = set()
+    out = []
+    for pair in resolved:
+        if pair not in seen:
+            seen.add(pair)
+            out.append(pair)
+    return out
+
+def split_count(total, n):
+    """Split `total` questions as evenly as possible across `n` topics"""
+    if n <= 0:
+        return []
+    base = total // n
+    rem = total % n
+    return [base + (1 if i < rem else 0) for i in range(n)]
+
+# ============================================
 # FIREBASE FUNCTIONS
 # ============================================
 
-def get_firebase_questions(topic):
-    """Fetch questions from Firebase"""
+def get_firebase_questions(topic, subject=None):
+    """Fetch questions from Firebase at /questions/{subject}/{topic}"""
     if not FIREBASE_AVAILABLE:
         return None
-    
+
     try:
-        # Parse topic: "fractions" -> math/fractions
-        subject, subtopic = topic.lower().split('_') if '_' in topic else (topic.lower(), topic.lower())
-        
-        path = f'/questions/{subject}/{subtopic}'
+        subj = subject or find_subject_for_topic(topic) or topic
+        path = f'/questions/{subj}/{topic}'
         ref = db.reference(path)
         data = ref.get()
-        
+
         if data:
             return data
     except Exception as e:
         print(f"Firebase error: {e}")
-    
+
     return None
 
-def fetch_questions_from_firebase(topic, count=5, difficulty='mixed'):
+def fetch_questions_from_firebase(topic, count=5, difficulty='mixed', subject=None):
     """Get questions from Firebase with fallback"""
-    firebase_data = get_firebase_questions(topic)
-    
+    firebase_data = get_firebase_questions(topic, subject)
+
     if not firebase_data:
         return None
-    
+
     questions = []
-    
-    # Get difficulty levels
-    if difficulty == 'mixed':
+
+    # Try the requested single difficulty first (adaptive mode)
+    if difficulty != 'mixed' and difficulty in firebase_data:
+        level_questions = list(firebase_data[difficulty].values()) if isinstance(firebase_data[difficulty], dict) else firebase_data[difficulty]
+        questions.extend(level_questions)
+
+    # Fall back to a mixed blend if no single-difficulty questions were found
+    if not questions:
         for level in ['easy', 'medium', 'hard']:
             if level in firebase_data:
                 level_questions = list(firebase_data[level].values()) if isinstance(firebase_data[level], dict) else firebase_data[level]
                 questions.extend(level_questions[:count//3 + 1])
-    else:
-        if difficulty in firebase_data:
-            level_questions = list(firebase_data[difficulty].values()) if isinstance(firebase_data[difficulty], dict) else firebase_data[difficulty]
-            questions.extend(level_questions)
-    
+
+    if not questions:
+        return None
+
     return random.sample(questions, min(count, len(questions)))
+
+def get_next_difficulty(student, topic):
+    """Decide difficulty for the next quiz based on the student's last score on this topic"""
+    prog = student.get('progress', {}).get(topic)
+    if not prog or 'last_score' not in prog:
+        return 'mixed'  # first attempt on this topic: give a mixed set
+
+    last_score = prog['last_score']
+    if last_score >= 85:
+        return 'hard'
+    elif last_score >= 60:
+        return 'medium'
+    else:
+        return 'easy'
+
+def save_progress_to_firebase(user_id, student):
+    """Push this student's stars/level/progress to Firebase so the web dashboard can read it"""
+    if not FIREBASE_AVAILABLE:
+        return
+    try:
+        db.reference(f'/students/{user_id}').set({
+            'name': student.get('name', 'Student'),
+            'stars': student.get('stars', 0),
+            'level': student.get('level', 'Bronze'),
+            'progress': student.get('progress', {}),
+            'badges': student.get('badges', []),
+        })
+    except Exception as e:
+        print(f"⚠️ Firebase write error: {e}")
 
 # ============================================
 # CLAUDE FALLBACK
@@ -136,6 +222,42 @@ def generate_questions_claude(topic, count=5, language='english'):
     except:
         return []
 
+def detect_quiz_intent(text):
+    """Ask Claude whether a free-chat message is asking for practice questions, and extract topics/count if so."""
+    known_topics = ', '.join(sorted(set(t for topics in SUBJECT_MAP.values() for t in topics)))
+    known_subjects = ', '.join(SUBJECT_MAP.keys())
+    prompt = f"""A student is chatting with a P6 tutor bot. Decide if this message is asking for practice quiz questions.
+
+Message: "{text}"
+
+Known subjects: {known_subjects}
+Known specific topics: {known_topics}
+
+If it IS a request for questions, extract:
+- topics: a list using ONLY the exact names above (subject names and/or specific topic names) that match what the student asked for. Empty list if no specific topic was named (student wants something random).
+- count: how many questions total were asked for (a number). Default to 5 if not stated.
+
+Respond with ONLY compact JSON, nothing else:
+{{"is_quiz_request": true, "topics": ["ratio", "fractions"], "count": 10}}
+or
+{{"is_quiz_request": false, "topics": [], "count": 0}}
+"""
+    try:
+        response = anthropic.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        out = response.content[0].text.strip()
+        if out.startswith("```"):
+            out = out.strip('`')
+            if out.lower().startswith('json'):
+                out = out[4:]
+        return json.loads(out)
+    except Exception as e:
+        print(f"Intent detection error: {e}")
+        return {"is_quiz_request": False, "topics": [], "count": 0}
+
 # ============================================
 # QUESTION HANDLING
 # ============================================
@@ -160,6 +282,53 @@ def score_answer(user_answer, correct_answer):
     user_ans = user_answer.strip().upper()
     correct_ans = correct_answer.strip().upper()
     return user_ans == correct_ans
+
+async def send_quiz(update, student, topic_pairs, count):
+    """Build a quiz across one or more (subject, topic) pairs, splitting count between them,
+    using Firebase + adaptive difficulty where possible and falling back to Claude otherwise."""
+    n = len(topic_pairs)
+    counts = split_count(count, n)
+
+    all_questions = []
+    for (subject, topic), per_count in zip(topic_pairs, counts):
+        if per_count <= 0:
+            continue
+        difficulty = get_next_difficulty(student, topic)
+        qs = fetch_questions_from_firebase(topic, per_count, difficulty, subject) if FIREBASE_AVAILABLE else None
+        if not qs:
+            qs = generate_questions_claude(topic, per_count)
+        if qs:
+            for q in qs:
+                q['_topic'] = topic
+            all_questions.extend(qs)
+
+    if not all_questions:
+        await update.message.reply_text("❌ Could not generate questions. Try another topic.")
+        return
+
+    # Store for scoring
+    student['current_questions'] = all_questions
+    student['current_topics'] = [t for _, t in topic_pairs]
+    student['current_topic'] = student['current_topics'][0]  # fallback label
+    student['answers'] = []
+
+    topic_labels = ', '.join(t.replace('_', ' ').title() for _, t in topic_pairs)
+    header = f"*QUIZ: {topic_labels} - {len(all_questions)} Questions*\n\n"
+
+    # Split into multiple Telegram messages if it gets long (Telegram's limit is ~4096 chars)
+    messages = []
+    current_msg = header
+    for i, q in enumerate(all_questions, 1):
+        block = format_question(q, i) + "\n"
+        if len(current_msg) + len(block) > 3500:
+            messages.append(current_msg)
+            current_msg = ""
+        current_msg += block
+    current_msg += "\n_Send answers as: Q1: A, Q2: B, Q3: C, etc_"
+    messages.append(current_msg)
+
+    for msg in messages:
+        await update.message.reply_text(msg, parse_mode='Markdown')
 
 # ============================================
 # REWARD SYSTEM
@@ -236,8 +405,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 *Examples:*
 /questions fractions 10
-/questions grammar 5
-/questions characters 8 chinese
+/questions ratio,fractions,algebra 20
+/questions math 15
+/questions 10 (random topic)
+
+Or just chat normally, e.g:
+"kasih aku 10 soal ratio sama pecahan"
+"give me 20 science questions"
 
 *Other Commands:*
 /score - Your stars & level
@@ -247,43 +421,32 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message, parse_mode='Markdown')
 
 async def questions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate and send questions"""
+    """Generate and send questions. Flexible: /questions [topic(s) or subject] [count]
+    Topic(s) can be omitted (random topic), a single topic, a whole subject (e.g. 'math'),
+    or several comma-separated topics/subjects (e.g. 'ratio,fractions,algebra')."""
     user_id = update.effective_user.id
     student = get_student(user_id)
-    
-    if not context.args or len(context.args) < 1:
-        await update.message.reply_text("Usage: /questions [topic] [count]\nExample: /questions fractions 10")
-        return
-    
-    topic = context.args[0].lower()
-    count = int(context.args[1]) if len(context.args) > 1 else 5
-    count = min(count, 20)  # Max 20 questions
-    
-    await update.message.reply_text(f"⏳ Generating {count} {topic} questions...")
-    
-    # Try Firebase first
-    questions = fetch_questions_from_firebase(topic, count) if FIREBASE_AVAILABLE else None
-    
-    # Fallback to Claude
-    if not questions:
-        questions = generate_questions_claude(topic, count)
-    
-    if not questions:
-        await update.message.reply_text("❌ Could not generate questions. Try another topic.")
-        return
-    
-    # Store for scoring
-    student['current_questions'] = questions
-    student['current_topic'] = topic
-    student['answers'] = []
-    
-    # Send questions
-    msg = f"*{topic.upper()} QUIZ - {len(questions)} Questions*\n\n"
-    for i, q in enumerate(questions, 1):
-        msg += format_question(q, i) + "\n"
-    
-    msg += "\n_Send answers as: Q1: A, Q2: B, Q3: C, etc_"
-    await update.message.reply_text(msg, parse_mode='Markdown')
+
+    args = context.args or []
+
+    count = 5
+    topic_tokens = args
+    if args and args[-1].isdigit():
+        count = int(args[-1])
+        topic_tokens = args[:-1]
+    count = max(1, min(count, 50))
+
+    raw_topics = ' '.join(topic_tokens).strip()
+    if raw_topics:
+        normalized = raw_topics.replace('+', ',').replace(' dan ', ',').replace(' and ', ',')
+        spec_tokens = [t.strip().lower() for t in normalized.split(',') if t.strip()]
+    else:
+        spec_tokens = []
+
+    topic_pairs = resolve_topics(spec_tokens)
+
+    await update.message.reply_text(f"⏳ Generating {count} question(s)...")
+    await send_quiz(update, student, topic_pairs, count)
 
 async def submit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Submit answers and get score"""
@@ -316,36 +479,48 @@ async def submit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     correct = 0
     total = len(student['current_questions'])
     feedback = "*📊 Your Answers:*\n\n"
-    
+    topic_stats = {}  # topic -> [correct_count, total_count], since a quiz can span several topics
+
     for i, q in enumerate(student['current_questions'], 1):
         correct_ans = q.get('a', '').upper()
         user_ans = answers.get(i, '❌').upper()
         is_correct = score_answer(user_ans, correct_ans)
-        
+
         status = "✅" if is_correct else "❌"
         if is_correct:
             correct += 1
-        
+
         feedback += f"{status} Q{i}: {user_ans} (Answer: {correct_ans})\n"
-    
+
+        q_topic = q.get('_topic', student.get('current_topic', 'unknown'))
+        stats = topic_stats.setdefault(q_topic, [0, 0])
+        stats[1] += 1
+        if is_correct:
+            stats[0] += 1
+
     score_percent = (correct / total * 100) if total > 0 else 0
     stars_earned = calculate_stars(score_percent)
-    
+
     student['stars'] += stars_earned
     student['level'] = update_level(student['stars'])
-    
-    # Update progress
-    topic = student.get('current_topic', 'unknown')
-    if topic not in student['progress']:
-        student['progress'][topic] = {'attempts': 0, 'best': 0}
-    student['progress'][topic]['attempts'] += 1
-    student['progress'][topic]['best'] = max(student['progress'][topic]['best'], score_percent)
-    
+
+    # Update progress per topic actually covered in this quiz
+    for q_topic, (t_correct, t_total) in topic_stats.items():
+        t_score_percent = (t_correct / t_total * 100) if t_total > 0 else 0
+        if q_topic not in student['progress']:
+            student['progress'][q_topic] = {'attempts': 0, 'best': 0}
+        student['progress'][q_topic]['attempts'] += 1
+        student['progress'][q_topic]['best'] = max(student['progress'][q_topic]['best'], t_score_percent)
+        student['progress'][q_topic]['last_score'] = t_score_percent
+
     feedback += f"\n*Score: {correct}/{total} ({score_percent:.0f}%)*"
     feedback += f"\n⭐ Stars Earned: +{stars_earned}"
     feedback += f"\n📊 Total Stars: {student['stars']}"
     feedback += f"\n🎖️ Level: {student['level']}"
-    
+
+    # Push to Firebase so the web dashboard can show it
+    save_progress_to_firebase(user_id, student)
+
     await update.message.reply_text(feedback, parse_mode='Markdown')
 
 async def score_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -402,7 +577,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'Q' in text and ':' in text and ',' in text:
         await submit_command(update, context)
         return
-    
+
+    # Check if this is a natural-language request for practice questions
+    intent = detect_quiz_intent(text)
+    if intent.get('is_quiz_request'):
+        count = intent.get('count') or 5
+        count = max(1, min(int(count), 50))
+        topic_pairs = resolve_topics(intent.get('topics') or [])
+        await update.message.reply_text(f"⏳ Generating {count} question(s)...")
+        await send_quiz(update, student, topic_pairs, count)
+        return
+
     # General chat with Claude
     student['conversation_history'].append({
         "role": "user",
