@@ -1,417 +1,452 @@
 #!/usr/bin/env python3
 """
-My Pals Tutor Bot - dengan Score & Rewards
-Track stars, levels, badges per topic
+P6 Tutor Bot with Firebase Integration
+Bina Bangsa School Curriculum + Chinese
+Reads from Firebase database + Claude fallback
 """
 
 import os
 import json
-from datetime import datetime
+import random
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from anthropic import Anthropic
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
-from reportlab.lib.units import inch
-import io
+import firebase_admin
+from firebase_admin import credentials, db
 
-client = Anthropic()
-user_convos = {}
+# ============================================
+# INITIALIZE CLIENTS
+# ============================================
 
-# In-memory user database (akan di-upgrade ke Firebase nanti)
-user_stats = {}
+# Firebase
+try:
+    cred = credentials.Certificate(os.getenv('FIREBASE_CREDENTIALS_JSON', 'firebase-credentials.json'))
+    if not firebase_admin.get_app():
+        firebase_admin.initialize_app(cred, {
+            'databaseURL': 'https://mypalstutorbot-default-rtdb.asia-southeast1.firebasedatabase.app'
+        })
+    FIREBASE_AVAILABLE = True
+    print("✅ Firebase connected")
+except Exception as e:
+    print(f"⚠️ Firebase unavailable: {e}")
+    FIREBASE_AVAILABLE = False
 
-SYSTEM_PROMPT = """You are a friendly P6 tutor using My Pals Are Here 3rd Edition textbook.
+# Anthropic
+anthropic = Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
 
-ALWAYS answer in ENGLISH, even if student asks in Indonesian.
+# ============================================
+# IN-MEMORY STORAGE
+# ============================================
 
-Topics: Math, Science, English, Bahasa Indonesia (P6 level)
+student_data = {}
 
-WHEN ASKED FOR QUESTIONS:
-- Generate exact number requested
-- Format: 15 ABCD questions + 5 essay questions (unless specified)
-- IMPORTANT: Do NOT include answers in the questions themselves
-- Each question should be clear and standalone
-- Include difficulty level (Easy/Medium/Hard)
-
-WHEN EXPLAINING:
-- Use analogies and real-world examples
-- Include memory tricks
-- Step-by-step breakdown
-- Use emojis to make it fun
-
-BE FLEXIBLE: Student can ask for any number/format of questions."""
-
-# Reward thresholds
-LEVELS = {
-    "Bronze": 0,
-    "Silver": 100,
-    "Gold": 300,
-    "Platinum": 500
-}
-
-def get_level(stars):
-    """Get level based on stars"""
-    if stars >= 500:
-        return "Platinum"
-    elif stars >= 300:
-        return "Gold"
-    elif stars >= 100:
-        return "Silver"
-    else:
-        return "Bronze"
-
-def init_user(user_id):
-    """Initialize user stats"""
-    if user_id not in user_stats:
-        user_stats[user_id] = {
-            "name": f"Student_{user_id}",
-            "stars": 0,
-            "level": "Bronze",
-            "topics": {},
-            "created": datetime.now().isoformat()
+def get_student(user_id):
+    if user_id not in student_data:
+        student_data[user_id] = {
+            'name': 'Student',
+            'stars': 0,
+            'level': 'Bronze',
+            'progress': {},
+            'badges': [],
+            'conversation_history': []
         }
+    return student_data[user_id]
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_convos[user_id] = []
-    init_user(user_id)
-    
-    msg = """Hello! I'm your My Pals Tutor Bot! 👋
+# ============================================
+# FIREBASE FUNCTIONS
+# ============================================
 
-I help with:
-📚 Mathematics | 🔬 Science | 🇬🇧 English | 🇮🇩 Bahasa Indonesia
-
-Ask me anything:
-- "Explain fractions for P6"
-- "Give me 20 questions about photosynthesis"
-- "5 medium questions: 4 ABCD + 1 essay about grammar"
-
-Commands:
-/help - Show this message
-/reset - Start new topic
-/questions [topic] [count] - Get questions with answer sheet PDF
-/score - View your stars & level
-/progress - View progress by topic
-/submit - Submit quiz answers for scoring"""
-    
-    await update.message.reply_text(msg)
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
-
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_convos[user_id] = []
-    await update.message.reply_text("✅ Conversation reset! Ask me a new topic.")
-
-async def score_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show user score, stars, and level"""
-    user_id = update.effective_user.id
-    init_user(user_id)
-    
-    stats = user_stats[user_id]
-    level = stats["level"]
-    stars = stats["stars"]
-    
-    # Get next level milestone
-    level_list = list(LEVELS.items())
-    current_idx = [i for i, (l, _) in enumerate(level_list) if l == level][0]
-    if current_idx < len(level_list) - 1:
-        next_level = level_list[current_idx + 1]
-        needed_stars = next_level[1] - stars
-        progress = f"\n📈 {needed_stars} more stars to reach {next_level[0]}!"
-    else:
-        progress = "\n🏆 You've reached the highest level!"
-    
-    msg = f"""⭐ YOUR SCORE
-
-Stars: {stars}
-Level: {level}
-{progress}
-
-Topics Completed: {len([t for t in stats['topics'] if stats['topics'][t]['completed'] > 0])}"""
-    
-    await update.message.reply_text(msg)
-
-async def progress_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show progress by topic"""
-    user_id = update.effective_user.id
-    init_user(user_id)
-    
-    stats = user_stats[user_id]
-    
-    if not stats['topics']:
-        msg = "No progress yet! Try /questions [topic] to start."
-    else:
-        msg = "📊 PROGRESS BY TOPIC\n\n"
-        for topic, data in stats['topics'].items():
-            completed = data.get('completed', 0)
-            total = data.get('total', 0)
-            score = data.get('score', 0)
-            msg += f"{topic}: {completed}/{total} completed | Score: {score}%\n"
-    
-    await update.message.reply_text(msg)
-
-async def submit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Guide for submitting answers"""
-    msg = """📝 HOW TO SUBMIT ANSWERS:
-
-1. Download the answer sheet PDF
-2. Do the questions on paper or file
-3. Reply with your answers in this format:
-
-Q1: B
-Q2: A
-Q3: C
-EQ1: [Your essay answer]
-
-I'll score and give you stars! ⭐"""
-    
-    await update.message.reply_text(msg)
-
-async def score_answers(update: Update, context: ContextTypes.DEFAULT_TYPE, topic: str = "General"):
-    """Score submitted answers"""
-    user_id = update.effective_user.id
-    user_message = update.message.text
-    init_user(user_id)
+def get_firebase_questions(topic):
+    """Fetch questions from Firebase"""
+    if not FIREBASE_AVAILABLE:
+        return None
     
     try:
-        # Use Claude to score answers
-        score_prompt = f"""Score these answers for a P6 {topic} quiz. Be generous but fair.
-
-Answers:
-{user_message}
-
-Reply with:
-1. Total score (as percentage)
-2. Brief feedback per answer
-3. Overall comment
-
-Format:
-Score: XX%
-Feedback:
-[Your feedback]"""
-
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1000,
-            messages=[{"role": "user", "content": score_prompt}]
-        )
+        # Parse topic: "fractions" -> math/fractions
+        subject, subtopic = topic.lower().split('_') if '_' in topic else (topic.lower(), topic.lower())
         
-        feedback = response.content[0].text
+        path = f'/questions/{subject}/{subtopic}'
+        ref = db.reference(path)
+        data = ref.get()
         
-        # Extract score (simple parsing)
-        score_line = [l for l in feedback.split('\n') if 'Score:' in l]
-        if score_line:
-            try:
-                score_pct = int(score_line[0].split(':')[1].strip().replace('%', ''))
-            except:
-                score_pct = 75  # Default
-        else:
-            score_pct = 75
-        
-        # Calculate stars (max 15 per quiz)
-        stars_earned = int((score_pct / 100) * 15)
-        
-        # Update stats
-        if topic not in user_stats[user_id]['topics']:
-            user_stats[user_id]['topics'][topic] = {
-                'completed': 0,
-                'total': 0,
-                'score': 0,
-                'stars': 0
-            }
-        
-        user_stats[user_id]['topics'][topic]['completed'] += 1
-        user_stats[user_id]['topics'][topic]['score'] = score_pct
-        user_stats[user_id]['topics'][topic]['stars'] += stars_earned
-        user_stats[user_id]['stars'] += stars_earned
-        user_stats[user_id]['level'] = get_level(user_stats[user_id]['stars'])
-        
-        msg = f"""✅ SCORED!
-
-Score: {score_pct}%
-Stars Earned: +{stars_earned} ⭐
-Total Stars: {user_stats[user_id]['stars']}
-Level: {user_stats[user_id]['level']}
-
-{feedback}"""
-        
-        await update.message.reply_text(msg)
-        
+        if data:
+            return data
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Error scoring: {str(e)}")
-
-async def questions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate questions and answer sheet"""
-    user_id = update.effective_user.id
-    init_user(user_id)
+        print(f"Firebase error: {e}")
     
-    if not context.args:
+    return None
+
+def fetch_questions_from_firebase(topic, count=5, difficulty='mixed'):
+    """Get questions from Firebase with fallback"""
+    firebase_data = get_firebase_questions(topic)
+    
+    if not firebase_data:
+        return None
+    
+    questions = []
+    
+    # Get difficulty levels
+    if difficulty == 'mixed':
+        for level in ['easy', 'medium', 'hard']:
+            if level in firebase_data:
+                level_questions = list(firebase_data[level].values()) if isinstance(firebase_data[level], dict) else firebase_data[level]
+                questions.extend(level_questions[:count//3 + 1])
+    else:
+        if difficulty in firebase_data:
+            level_questions = list(firebase_data[difficulty].values()) if isinstance(firebase_data[difficulty], dict) else firebase_data[difficulty]
+            questions.extend(level_questions)
+    
+    return random.sample(questions, min(count, len(questions)))
+
+# ============================================
+# CLAUDE FALLBACK
+# ============================================
+
+def generate_questions_claude(topic, count=5, language='english'):
+    """Generate questions using Claude API"""
+    prompt = f"""Generate {count} P6 Bina Bangsa School {topic.title()} quiz questions in {language}.
+    
+    Format ONLY as JSON array, no other text:
+    [
+      {{
+        "q": "Question text",
+        "a": "Correct answer",
+        "type": "ABCD",
+        "options": ["A", "B", "C", "D"],
+        "exp": "Explanation"
+      }}
+    ]
+    """
+    
+    response = anthropic.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=2000,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    
+    try:
+        text = response.content[0].text.strip()
+        # Remove markdown code blocks if present
+        if text.startswith("```"):
+            text = text[7:-3] if text.endswith("```") else text[7:]
+        return json.loads(text)
+    except:
+        return []
+
+# ============================================
+# QUESTION HANDLING
+# ============================================
+
+def format_question(question, index=1):
+    """Format question for display"""
+    q_text = question.get('q', '')
+    options = question.get('options', [])
+    
+    if options and len(options) == 4:
+        msg = f"*Question {index}:* {q_text}\n\n"
+        msg += f"A) {options[0]}\n"
+        msg += f"B) {options[1]}\n"
+        msg += f"C) {options[2]}\n"
+        msg += f"D) {options[3]}\n"
+        return msg
+    else:
+        return f"*Question {index}:* {q_text}\n"
+
+def score_answer(user_answer, correct_answer):
+    """Check if answer is correct"""
+    user_ans = user_answer.strip().upper()
+    correct_ans = correct_answer.strip().upper()
+    return user_ans == correct_ans
+
+# ============================================
+# REWARD SYSTEM
+# ============================================
+
+def calculate_stars(score_percentage):
+    """Convert score to stars"""
+    if score_percentage >= 90:
+        return 15
+    elif score_percentage >= 80:
+        return 12
+    elif score_percentage >= 70:
+        return 10
+    elif score_percentage >= 60:
+        return 7
+    else:
+        return 3
+
+def update_level(stars):
+    """Update level based on stars"""
+    if stars >= 500:
+        return 'Platinum'
+    elif stars >= 300:
+        return 'Gold'
+    elif stars >= 100:
+        return 'Silver'
+    else:
+        return 'Bronze'
+
+# ============================================
+# TELEGRAM HANDLERS
+# ============================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start command"""
+    user_id = update.effective_user.id
+    student = get_student(user_id)
+    
+    message = f"""
+🎓 *Welcome to Bina Bangsa P6 Tutor!*
+
+Hi {student['name']}! I'm your personal tutor bot.
+
+I can help you with:
+- 📘 Math (Fractions, Ratio, Percentage, Algebra, Geometry)
+- 🧪 Science (Photosynthesis, Ecosystems, Food Chain, etc)
+- 📝 English (Grammar, Vocabulary, Comprehension)
+- 🇮🇩 Bahasa Indonesia (Vocabulary, Grammar)
+- 🇨🇳 Chinese/Mandarin (Characters, Vocabulary, Grammar)
+
+*Commands:*
+/help - Show all commands
+/questions [topic] [count] - Get quiz questions
+/score - Show your progress
+/progress - Show progress by subject
+/reset - Clear conversation
+"""
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Help command"""
+    message = """
+*📚 Available Topics:*
+
+**MATH:** fractions, ratio, percentage, algebra, geometry, data, time
+
+**SCIENCE:** photosynthesis, ecosystems, food_chain, digestion, reproduction, weather, forces, machines, electricity
+
+**ENGLISH:** grammar, vocabulary, comprehension, tenses, punctuation
+
+**BAHASA INDONESIA:** vocabulary, grammar, stories, poetry, spelling
+
+**CHINESE:** characters, vocabulary, grammar, radicals, listening
+
+*Examples:*
+/questions fractions 10
+/questions grammar 5
+/questions characters 8 chinese
+
+*Other Commands:*
+/score - Your stars & level
+/progress - Progress by subject
+/reset - New conversation
+"""
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def questions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate and send questions"""
+    user_id = update.effective_user.id
+    student = get_student(user_id)
+    
+    if not context.args or len(context.args) < 1:
         await update.message.reply_text("Usage: /questions [topic] [count]\nExample: /questions fractions 10")
         return
     
-    topic = context.args[0]
-    count = int(context.args[1]) if len(context.args) > 1 else 20
+    topic = context.args[0].lower()
+    count = int(context.args[1]) if len(context.args) > 1 else 5
+    count = min(count, 20)  # Max 20 questions
     
-    await update.message.chat.send_action("typing")
+    await update.message.reply_text(f"⏳ Generating {count} {topic} questions...")
     
-    try:
-        # Request questions from Claude
-        prompt = f"""Generate {count} P6-level questions about {topic}.
-
-Format EXACTLY like this (NO ANSWERS IN QUESTIONS):
-
-Q1. [Question text]
-A) Option A
-B) Option B  
-C) Option C
-D) Option D
-
-For essay questions use:
-EQ1. [Essay question text]
-
-Do NOT include answers or explanations in the questions section."""
-
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=3000,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        
-        questions_text = response.content[0].text
-        
-        # Send questions
-        if len(questions_text) > 4090:
-            for chunk in [questions_text[i:i+4090] for i in range(0, len(questions_text), 4090)]:
-                await update.message.reply_text(chunk)
-        else:
-            await update.message.reply_text(questions_text)
-        
-        # Request answer key
-        await update.message.chat.send_action("typing")
-        
-        answer_prompt = f"""Based on the {topic} questions just provided, give ONLY the answer key with brief explanations.
-
-Format:
-Q1. Answer: [Letter]
-Explanation: [Brief]
-
-EQ1. Sample Answer: [Guide]"""
-
-        answer_response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=3000,
-            system=SYSTEM_PROMPT,
-            messages=[
-                {"role": "user", "content": prompt},
-                {"role": "assistant", "content": questions_text},
-                {"role": "user", "content": answer_prompt}
-            ]
-        )
-        
-        answers_text = answer_response.content[0].text
-        
-        # Generate PDF
-        pdf_buffer = io.BytesIO()
-        doc = SimpleDocTemplate(pdf_buffer, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
-        styles = getSampleStyleSheet()
-        
-        story = []
-        story.append(Paragraph(f"📝 {topic.title()} - Answer Key", styles['Heading1']))
-        story.append(Paragraph(f"P6 | {datetime.now().strftime('%Y-%m-%d')}", styles['Normal']))
-        story.append(Spacer(1, 0.3*inch))
-        
-        for line in answers_text.split('\n'):
-            if line.strip():
-                story.append(Paragraph(line, styles['Normal']))
-                story.append(Spacer(1, 0.05*inch))
-        
-        doc.build(story)
-        pdf_buffer.seek(0)
-        
-        # Send PDF
-        await update.message.reply_document(
-            document=pdf_buffer,
-            filename=f"{topic}_answers.pdf",
-            caption="📄 Answer Sheet\n\nWhen done, reply with your answers to get scored!"
-        )
-        
-        # Track in progress
-        if topic not in user_stats[user_id]['topics']:
-            user_stats[user_id]['topics'][topic] = {
-                'completed': 0,
-                'total': count,
-                'score': 0,
-                'stars': 0
-            }
-        else:
-            user_stats[user_id]['topics'][topic]['total'] = count
-        
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Error: {str(e)}")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_message = update.message.text
+    # Try Firebase first
+    questions = fetch_questions_from_firebase(topic, count) if FIREBASE_AVAILABLE else None
     
-    init_user(user_id)
+    # Fallback to Claude
+    if not questions:
+        questions = generate_questions_claude(topic, count)
     
-    if user_id not in user_convos:
-        user_convos[user_id] = []
-    
-    # Check if looks like answer submission
-    if any(marker in user_message.lower() for marker in ['q1:', 'q1.', 'eq1:', 'answer:']):
-        # Likely answer submission
-        await score_answers(update, context, topic="Quiz")
+    if not questions:
+        await update.message.reply_text("❌ Could not generate questions. Try another topic.")
         return
     
-    user_convos[user_id].append({"role": "user", "content": user_message})
-    await update.message.chat.send_action("typing")
+    # Store for scoring
+    student['current_questions'] = questions
+    student['current_topic'] = topic
+    student['answers'] = []
     
+    # Send questions
+    msg = f"*{topic.upper()} QUIZ - {len(questions)} Questions*\n\n"
+    for i, q in enumerate(questions, 1):
+        msg += format_question(q, i) + "\n"
+    
+    msg += "\n_Send answers as: Q1: A, Q2: B, Q3: C, etc_"
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def submit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Submit answers and get score"""
+    user_id = update.effective_user.id
+    student = get_student(user_id)
+    
+    if 'current_questions' not in student:
+        await update.message.reply_text("❌ No active quiz. Use /questions first!")
+        return
+    
+    if not update.message.text.startswith('/submit'):
+        # Parse answers from message
+        answer_text = update.message.text
+    else:
+        await update.message.reply_text("Send your answers as: Q1: A, Q2: B, Q3: C, etc")
+        return
+    
+    # Parse answers
     try:
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=2048,
-            system=SYSTEM_PROMPT,
-            messages=user_convos[user_id]
-        )
+        answers = {}
+        for part in answer_text.split(','):
+            q_num, answer = part.strip().split(':')
+            q_num = int(q_num.replace('Q', '').strip())
+            answers[q_num] = answer.strip().upper()
+    except:
+        await update.message.reply_text("❌ Invalid format. Use: Q1: A, Q2: B, Q3: C")
+        return
+    
+    # Score quiz
+    correct = 0
+    total = len(student['current_questions'])
+    feedback = "*📊 Your Answers:*\n\n"
+    
+    for i, q in enumerate(student['current_questions'], 1):
+        correct_ans = q.get('a', '').upper()
+        user_ans = answers.get(i, '❌').upper()
+        is_correct = score_answer(user_ans, correct_ans)
         
-        reply = response.content[0].text
-        user_convos[user_id].append({"role": "assistant", "content": reply})
+        status = "✅" if is_correct else "❌"
+        if is_correct:
+            correct += 1
         
-        if len(reply) > 4090:
-            for chunk in [reply[i:i+4090] for i in range(0, len(reply), 4090)]:
-                await update.message.reply_text(chunk)
-        else:
-            await update.message.reply_text(reply)
-            
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Error: {str(e)}")
+        feedback += f"{status} Q{i}: {user_ans} (Answer: {correct_ans})\n"
+    
+    score_percent = (correct / total * 100) if total > 0 else 0
+    stars_earned = calculate_stars(score_percent)
+    
+    student['stars'] += stars_earned
+    student['level'] = update_level(student['stars'])
+    
+    # Update progress
+    topic = student.get('current_topic', 'unknown')
+    if topic not in student['progress']:
+        student['progress'][topic] = {'attempts': 0, 'best': 0}
+    student['progress'][topic]['attempts'] += 1
+    student['progress'][topic]['best'] = max(student['progress'][topic]['best'], score_percent)
+    
+    feedback += f"\n*Score: {correct}/{total} ({score_percent:.0f}%)*"
+    feedback += f"\n⭐ Stars Earned: +{stars_earned}"
+    feedback += f"\n📊 Total Stars: {student['stars']}"
+    feedback += f"\n🎖️ Level: {student['level']}"
+    
+    await update.message.reply_text(feedback, parse_mode='Markdown')
+
+async def score_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show score and level"""
+    user_id = update.effective_user.id
+    student = get_student(user_id)
+    
+    message = f"""
+*⭐ Your Progress*
+
+👤 Student: {student['name']}
+⭐ Stars: {student['stars']}
+🎖️ Level: {student['level']}
+
+*Level Requirements:*
+🥉 Bronze: 0+ stars (current)
+🥈 Silver: 100+ stars
+🥇 Gold: 300+ stars
+💎 Platinum: 500+ stars
+"""
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show progress by subject"""
+    user_id = update.effective_user.id
+    student = get_student(user_id)
+    
+    if not student['progress']:
+        await update.message.reply_text("No quizzes attempted yet. Use /questions to start!")
+        return
+    
+    message = "*📊 Progress by Subject*\n\n"
+    for topic, data in student['progress'].items():
+        message += f"📘 {topic.title()}\n"
+        message += f"  Attempts: {data['attempts']}\n"
+        message += f"  Best: {data['best']:.0f}%\n\n"
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reset conversation"""
+    user_id = update.effective_user.id
+    if user_id in student_data:
+        student_data[user_id]['conversation_history'] = []
+    await update.message.reply_text("✅ Conversation reset!")
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle general messages"""
+    user_id = update.effective_user.id
+    student = get_student(user_id)
+    text = update.message.text
+    
+    # Check if submitting answers
+    if 'Q' in text and ':' in text and ',' in text:
+        await submit_command(update, context)
+        return
+    
+    # General chat with Claude
+    student['conversation_history'].append({
+        "role": "user",
+        "content": text
+    })
+    
+    response = anthropic.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=500,
+        system="You are a P6 tutor. Help the student learn Bina Bangsa curriculum. Be encouraging!",
+        messages=student['conversation_history']
+    )
+    
+    assistant_message = response.content[0].text
+    student['conversation_history'].append({
+        "role": "assistant",
+        "content": assistant_message
+    })
+    
+    await update.message.reply_text(assistant_message)
+
+# ============================================
+# MAIN
+# ============================================
 
 def main():
-    """Start the bot"""
-    token = os.getenv('TELEGRAM_BOT_TOKEN')
-    
-    if not token:
-        print("ERROR: TELEGRAM_BOT_TOKEN not set")
+    """Start bot"""
+    TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+    if not TOKEN:
+        print("❌ TELEGRAM_BOT_TOKEN not set!")
         return
     
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(TOKEN).build()
     
+    # Commands
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(CommandHandler("questions", questions_cmd))
-    app.add_handler(CommandHandler("score", score_cmd))
-    app.add_handler(CommandHandler("progress", progress_cmd))
-    app.add_handler(CommandHandler("submit", submit_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("questions", questions_command))
+    app.add_handler(CommandHandler("submit", submit_command))
+    app.add_handler(CommandHandler("score", score_command))
+    app.add_handler(CommandHandler("progress", progress_command))
+    app.add_handler(CommandHandler("reset", reset_command))
     
-    print("🤖 Bot started with Score & Rewards!")
+    # Messages
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    
+    print("🚀 Bot starting...")
     app.run_polling()
 
 if __name__ == '__main__':
