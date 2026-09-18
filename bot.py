@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-My Pals Tutor Bot - Simple Version (No Firebase for now)
+My Pals Tutor Bot - Blocking Version (Stable)
 Telegram bot untuk P6 Singapore Curriculum
 """
 
@@ -97,8 +97,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"⚠️ Error: {str(e)}")
 
-async def main():
-    """Start the bot"""
+def main():
+    """Start the bot - BLOCKING VERSION"""
     token = os.getenv('TELEGRAM_BOT_TOKEN')
     
     if not token:
@@ -113,9 +113,8 @@ async def main():
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("🤖 Bot started!")
-    await app.run_polling(allowed_updates=None, drop_pending_updates=True)
+    print("🤖 Bot started (blocking mode)!")
+    app.run_polling()
 
 if __name__ == '__main__':
-    import asyncio
-    asyncio.run(main())
+    main()
