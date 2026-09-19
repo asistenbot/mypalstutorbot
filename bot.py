@@ -8,6 +8,7 @@ Reads from Firebase database + Claude fallback
 import os
 import json
 import random
+import re
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from anthropic import Anthropic
@@ -49,16 +50,46 @@ anthropic = Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'))
 
 student_data = {}
 
+def load_student_from_firebase(user_id):
+    """Load a previously-saved student record from Firebase, if any."""
+    if not FIREBASE_AVAILABLE:
+        return None
+    try:
+        return db.reference(f'/students/{user_id}').get()
+    except Exception as e:
+        print(f"⚠️ Firebase read error: {e}")
+        return None
+
 def get_student(user_id):
+    """Get (or lazily hydrate) a student's in-memory record.
+
+    Bot restarts (redeploys, crashes, Railway restarts) wipe the in-memory
+    student_data dict. Without this hydration step, a returning student's
+    stars/progress would silently reset to 0 in memory, and their NEXT quiz
+    submission would overwrite Firebase with that smaller total - quietly
+    erasing real progress. So on first touch per process, we pull whatever
+    was last saved in Firebase instead of assuming a blank slate.
+    """
     if user_id not in student_data:
-        student_data[user_id] = {
-            'name': 'Student',
-            'stars': 0,
-            'level': 'Bronze',
-            'progress': {},
-            'badges': [],
-            'conversation_history': []
-        }
+        saved = load_student_from_firebase(user_id)
+        if saved:
+            student_data[user_id] = {
+                'name': saved.get('name', 'Student'),
+                'stars': saved.get('stars', 0),
+                'level': saved.get('level', 'Bronze'),
+                'progress': saved.get('progress', {}) or {},
+                'badges': saved.get('badges', []) or [],
+                'conversation_history': []
+            }
+        else:
+            student_data[user_id] = {
+                'name': 'Student',
+                'stars': 0,
+                'level': 'Bronze',
+                'progress': {},
+                'badges': [],
+                'conversation_history': []
+            }
     return student_data[user_id]
 
 # ============================================
@@ -197,36 +228,101 @@ def save_progress_to_firebase(user_id, student):
 # CLAUDE FALLBACK
 # ============================================
 
-def generate_questions_claude(topic, count=5, language='english'):
-    """Generate questions using Claude API"""
+def strip_code_fence(text):
+    """Strip a ```/```json code fence Claude sometimes wraps JSON output in.
+    Handles both fenced-with-language and bare fences, whatever the exact
+    marker length, instead of assuming a fixed offset."""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = lines[1:]  # drop opening ``` or ```json line
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        elif lines and lines[-1].strip().endswith("```"):
+            lines[-1] = lines[-1].strip()[:-3]
+        text = "\n".join(lines)
+    return text.strip()
+
+def generate_questions_claude(topic, count=5, language='english', qtype='ABCD'):
+    """Generate questions using Claude API. qtype is 'ABCD' (multiple choice,
+    default) or 'ESSAY' (open-ended, student writes their own answer)."""
+    qtype = (qtype or 'ABCD').upper()
+    if qtype not in ('ABCD', 'ESSAY'):
+        qtype = 'ABCD'
+
+    if qtype == 'ESSAY':
+        type_instruction = "These must be OPEN-ENDED / ESSAY questions with NO multiple-choice options - the student writes a short answer (1-3 sentences) in their own words."
+        schema = """[
+  {
+    "q": "Open-ended question text",
+    "type": "ESSAY",
+    "reasoning": "Brief notes on how you worked out what a correct answer should cover",
+    "a": "A model/reference answer written in full sentences",
+    "rubric": "2-4 short key points (as one string) an answer must mention to count as correct",
+    "exp": "Short explanation for the student"
+  }
+]"""
+        extra_check = ""
+    else:
+        type_instruction = "These must be multiple-choice (ABCD) questions with exactly 4 options each."
+        schema = """[
+  {
+    "q": "Question text",
+    "type": "ABCD",
+    "options": ["first answer choice", "second answer choice", "third answer choice", "fourth answer choice"],
+    "reasoning": "Brief step-by-step working showing exactly how you solved this",
+    "a": "The correct option's exact text, copied verbatim character-for-character from one of the 4 items in options above (NOT a letter like A/B/C/D)",
+    "exp": "Short explanation for the student"
+  }
+]"""
+        extra_check = " After solving, re-read all 4 options and confirm exactly one matches your worked-out answer and the other 3 are genuinely wrong - this step is mandatory, mislabeling the correct option is the single most common mistake to avoid."
+
     prompt = f"""Generate {count} P6 Bina Bangsa School {topic.title()} quiz questions in {language}.
-    
-    Format ONLY as JSON array, no other text:
-    [
-      {{
-        "q": "Question text",
-        "a": "The correct option's exact text, copied verbatim from one of the 4 items in options below (NOT a letter like A/B/C/D)",
-        "type": "ABCD",
-        "options": ["first answer choice", "second answer choice", "third answer choice", "fourth answer choice"],
-        "exp": "Explanation"
-      }}
-    ]
-    """
-    
-    response = anthropic.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    
+
+{type_instruction}
+
+IMPORTANT: For each question, work out the correct answer STEP BY STEP first (put your working in the "reasoning" field) and double-check any arithmetic or facts before filling in "a", so "a" is guaranteed correct.{extra_check}
+
+Format ONLY as a JSON array, no other text:
+{schema}
+"""
+
     try:
-        text = response.content[0].text.strip()
-        # Remove markdown code blocks if present
-        if text.startswith("```"):
-            text = text[7:-3] if text.endswith("```") else text[7:]
-        return json.loads(text)
-    except:
+        response = anthropic.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=4000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = strip_code_fence(response.content[0].text.strip())
+        questions = json.loads(text)
+    except Exception as e:
+        print(f"⚠️ Question generation error: {e}")
         return []
+
+    # Validate before returning: never ship a question we can't reliably score.
+    # For ABCD, 'a' must actually match one of the 4 options (or be a bare
+    # letter) - if it doesn't match anything at all, drop the question rather
+    # than silently sending something unscoreable.
+    valid = []
+    for q in questions if isinstance(questions, list) else []:
+        if not isinstance(q, dict) or not q.get('q'):
+            continue
+        qt = str(q.get('type', qtype)).upper()
+        if qt == 'ESSAY':
+            if q.get('a'):
+                q['type'] = 'ESSAY'
+                valid.append(q)
+            continue
+        options = q.get('options', [])
+        if not isinstance(options, list) or len(options) != 4:
+            continue
+        raw = str(q.get('a', '')).strip().upper()
+        matches_option = any(str(opt).strip().upper() == raw for opt in options)
+        matches_letter = raw in ('A', 'B', 'C', 'D')
+        if matches_option or matches_letter:
+            q['type'] = 'ABCD'
+            valid.append(q)
+    return valid
 
 def detect_quiz_intent(text):
     """Ask Claude whether a free-chat message is asking for practice questions, and extract topics/count if so."""
@@ -242,11 +338,12 @@ Known specific topics: {known_topics}
 If it IS a request for questions, extract:
 - topics: a list using ONLY the exact names above (subject names and/or specific topic names) that match what the student asked for. Empty list if no specific topic was named (student wants something random).
 - count: how many questions total were asked for (a number). Default to 5 if not stated.
+- type: "ESSAY" if the student asked for open-ended/essay/"esai"/written-answer questions, otherwise "ABCD" (default, multiple choice).
 
 Respond with ONLY compact JSON, nothing else:
-{{"is_quiz_request": true, "topics": ["ratio", "fractions"], "count": 10}}
+{{"is_quiz_request": true, "topics": ["ratio", "fractions"], "count": 10, "type": "ABCD"}}
 or
-{{"is_quiz_request": false, "topics": [], "count": 0}}
+{{"is_quiz_request": false, "topics": [], "count": 0, "type": "ABCD"}}
 """
     try:
         response = anthropic.messages.create(
@@ -254,15 +351,14 @@ or
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}]
         )
-        out = response.content[0].text.strip()
-        if out.startswith("```"):
-            out = out.strip('`')
-            if out.lower().startswith('json'):
-                out = out[4:]
-        return json.loads(out)
+        out = strip_code_fence(response.content[0].text.strip())
+        result = json.loads(out)
+        if str(result.get('type', 'ABCD')).upper() not in ('ABCD', 'ESSAY'):
+            result['type'] = 'ABCD'
+        return result
     except Exception as e:
         print(f"Intent detection error: {e}")
-        return {"is_quiz_request": False, "topics": [], "count": 0}
+        return {"is_quiz_request": False, "topics": [], "count": 0, "type": "ABCD"}
 
 # ============================================
 # QUESTION HANDLING
@@ -272,8 +368,9 @@ def format_question(question, index=1):
     """Format question for display"""
     q_text = question.get('q', '')
     options = question.get('options', [])
-    
-    if options and len(options) == 4:
+    qtype = str(question.get('type', 'ABCD')).upper()
+
+    if qtype != 'ESSAY' and options and len(options) == 4:
         msg = f"*Question {index}:* {q_text}\n\n"
         msg += f"A) {options[0]}\n"
         msg += f"B) {options[1]}\n"
@@ -281,7 +378,7 @@ def format_question(question, index=1):
         msg += f"D) {options[3]}\n"
         return msg
     else:
-        return f"*Question {index}:* {q_text}\n"
+        return f"*Question {index}:* {q_text}\n_(Write your answer in your own words)_\n"
 
 def score_answer(user_answer, correct_answer):
     """Check if answer is correct"""
@@ -314,9 +411,55 @@ def get_correct_answer_info(question):
     # Fallback: couldn't resolve against options, just return what we have
     return raw.upper(), raw
 
-async def send_quiz(update, student, topic_pairs, count):
+def grade_essay_answers(items):
+    """Grade a batch of essay answers in one Claude call.
+    items: list of {index, q, a (model answer), rubric, user_answer}
+    Returns {index: {'correct': bool, 'feedback': str}}"""
+    if not items:
+        return {}
+
+    payload = [{
+        "index": it['index'],
+        "question": it['q'],
+        "model_answer": it.get('a', ''),
+        "rubric": it.get('rubric', ''),
+        "student_answer": it.get('user_answer', '')
+    } for it in items]
+
+    prompt = f"""You are grading a P6 student's short written answers. For each item, compare the student's answer against the model answer and rubric. Be encouraging and lenient about wording, spelling and grammar - mark it correct if the core idea/substance is right even if phrased differently. A blank or clearly unrelated/off-topic answer is wrong.
+
+Items (JSON):
+{json.dumps(payload)}
+
+Respond with ONLY a JSON array, no other text, one entry per item in the same order:
+[
+  {{"index": 1, "correct": true, "feedback": "One short encouraging sentence of feedback for the student"}}
+]
+"""
+    try:
+        response = anthropic.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = strip_code_fence(response.content[0].text.strip())
+        results = json.loads(text)
+        return {
+            int(r['index']): {'correct': bool(r.get('correct')), 'feedback': str(r.get('feedback', ''))}
+            for r in results if isinstance(r, dict) and 'index' in r
+        }
+    except Exception as e:
+        print(f"⚠️ Essay grading error: {e}")
+        # Fail safe: never silently mark as right or wrong when grading itself broke.
+        return {it['index']: {'correct': False, 'feedback': '⚠️ Could not auto-grade this one, please double check with your tutor.'} for it in items}
+
+async def send_quiz(update, student, topic_pairs, count, qtype='ABCD'):
     """Build a quiz across one or more (subject, topic) pairs, splitting count between them,
-    using Firebase + adaptive difficulty where possible and falling back to Claude otherwise."""
+    using Firebase + adaptive difficulty where possible and falling back to Claude otherwise.
+    qtype is 'ABCD' (default, multiple choice) or 'ESSAY' (open-ended)."""
+    qtype = (qtype or 'ABCD').upper()
+    if qtype not in ('ABCD', 'ESSAY'):
+        qtype = 'ABCD'
     n = len(topic_pairs)
     counts = split_count(count, n)
 
@@ -325,9 +468,11 @@ async def send_quiz(update, student, topic_pairs, count):
         if per_count <= 0:
             continue
         difficulty = get_next_difficulty(student, topic)
-        qs = fetch_questions_from_firebase(topic, per_count, difficulty, subject) if FIREBASE_AVAILABLE else None
+        # The Firebase question pool only contains multiple-choice questions,
+        # so essay requests always go straight to Claude generation.
+        qs = fetch_questions_from_firebase(topic, per_count, difficulty, subject) if (FIREBASE_AVAILABLE and qtype == 'ABCD') else None
         if not qs:
-            qs = generate_questions_claude(topic, per_count)
+            qs = generate_questions_claude(topic, per_count, qtype=qtype)
         if qs:
             for q in qs:
                 q['_topic'] = topic
@@ -355,7 +500,10 @@ async def send_quiz(update, student, topic_pairs, count):
             messages.append(current_msg)
             current_msg = ""
         current_msg += block
-    current_msg += "\n_Send answers as: Q1: A, Q2: B, Q3: C, etc_"
+    if qtype == 'ESSAY':
+        current_msg += "\n_Send your answers as: Q1: <your answer>, Q2: <your answer>, etc - write in your own words_"
+    else:
+        current_msg += "\n_Send answers as: Q1: A, Q2: B, Q3: C, etc_"
     messages.append(current_msg)
 
     for msg in messages:
@@ -439,10 +587,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /questions ratio,fractions,algebra 20
 /questions math 15
 /questions 10 (random topic)
+/questions fractions essay 5 (open-ended/essay questions)
 
 Or just chat normally, e.g:
 "kasih aku 10 soal ratio sama pecahan"
 "give me 20 science questions"
+"kasih aku 5 soal essay fractions"
 
 *Other Commands:*
 /score - Your stars & level
@@ -467,6 +617,19 @@ async def questions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         topic_tokens = args[:-1]
     count = max(1, min(count, 50))
 
+    # Pull out an optional type keyword (essay/abcd) from the topic tokens
+    qtype = 'ABCD'
+    filtered_tokens = []
+    for tok in topic_tokens:
+        tl = tok.strip().lower()
+        if tl in ('essay', 'esai', 'esei'):
+            qtype = 'ESSAY'
+        elif tl in ('abcd', 'mc', 'pg', 'pilihan', 'multiple', 'multiplechoice'):
+            qtype = 'ABCD'
+        else:
+            filtered_tokens.append(tok)
+    topic_tokens = filtered_tokens
+
     raw_topics = ' '.join(topic_tokens).strip()
     if raw_topics:
         normalized = raw_topics.replace('+', ',').replace(' dan ', ',').replace(' and ', ',')
@@ -477,56 +640,87 @@ async def questions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     topic_pairs = resolve_topics(spec_tokens)
 
     await update.message.reply_text(f"⏳ Generating {count} question(s)...")
-    await send_quiz(update, student, topic_pairs, count)
+    await send_quiz(update, student, topic_pairs, count, qtype=qtype)
+
+def parse_answers(text):
+    """Parse 'Q1: B, Q2: some essay answer, could have commas, Q3: C' into
+    {1: 'B', 2: 'some essay answer, could have commas', 3: 'C'}. Regex-based
+    (not a naive split on ',') so essay answers containing commas don't get
+    chopped up or thrown off the question numbering."""
+    pattern = re.compile(r'Q\s*(\d+)\s*:\s*(.*?)(?=(?:,\s*)?Q\s*\d+\s*:|$)', re.S | re.I)
+    answers = {}
+    for m in pattern.finditer(text):
+        num = int(m.group(1))
+        ans = m.group(2).strip().rstrip(',').strip()
+        answers[num] = ans
+    return answers
 
 async def submit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Submit answers and get score"""
     user_id = update.effective_user.id
     student = get_student(user_id)
-    
+
     if 'current_questions' not in student:
         await update.message.reply_text("❌ No active quiz. Use /questions first!")
         return
-    
+
     if not update.message.text.startswith('/submit'):
         # Parse answers from message
         answer_text = update.message.text
     else:
         await update.message.reply_text("Send your answers as: Q1: A, Q2: B, Q3: C, etc")
         return
-    
-    # Parse answers
-    try:
-        answers = {}
-        for part in answer_text.split(','):
-            q_num, answer = part.strip().split(':')
-            q_num = int(q_num.replace('Q', '').strip())
-            answers[q_num] = answer.strip().upper()
-    except:
-        await update.message.reply_text("❌ Invalid format. Use: Q1: A, Q2: B, Q3: C")
+
+    answers = parse_answers(answer_text)
+    if not answers:
+        await update.message.reply_text("❌ Invalid format. Use: Q1: A, Q2: B, Q3: C (or your written answer for essay questions)")
         return
-    
-    # Score quiz
-    correct = 0
-    total = len(student['current_questions'])
+
+    questions = student['current_questions']
+    total = len(questions)
+
+    lines = {}          # i -> display line
+    correctness = {}    # i -> bool
+    essay_items = []
+
+    for i, q in enumerate(questions, 1):
+        qtype = str(q.get('type', 'ABCD')).upper()
+        user_ans = answers.get(i, '').strip()
+        if qtype == 'ESSAY':
+            essay_items.append({
+                'index': i, 'q': q.get('q', ''), 'a': q.get('a', ''),
+                'rubric': q.get('rubric', ''), 'user_answer': user_ans
+            })
+        else:
+            correct_letter, correct_value = get_correct_answer_info(q)
+            is_correct = bool(user_ans) and score_answer(user_ans, correct_letter)
+            correctness[i] = is_correct
+            status = "✅" if is_correct else "❌"
+            shown = user_ans.upper() if user_ans else '(blank)'
+            lines[i] = f"{status} Q{i}: {shown} (Answer: {correct_letter} - {correct_value})\n"
+
+    if essay_items:
+        essay_results = grade_essay_answers(essay_items)
+        for item in essay_items:
+            i = item['index']
+            result = essay_results.get(i, {'correct': False, 'feedback': ''})
+            is_correct = bool(result.get('correct'))
+            correctness[i] = is_correct
+            status = "✅" if is_correct else "❌"
+            shown = item['user_answer'] if item['user_answer'] else '(blank)'
+            fb = f" — {result['feedback']}" if result.get('feedback') else ""
+            lines[i] = f"{status} Q{i}: {shown}{fb}\n"
+
+    correct = sum(1 for v in correctness.values() if v)
     feedback = "*📊 Your Answers:*\n\n"
     topic_stats = {}  # topic -> [correct_count, total_count], since a quiz can span several topics
 
-    for i, q in enumerate(student['current_questions'], 1):
-        correct_letter, correct_value = get_correct_answer_info(q)
-        user_ans = answers.get(i, '❌').upper()
-        is_correct = score_answer(user_ans, correct_letter)
-
-        status = "✅" if is_correct else "❌"
-        if is_correct:
-            correct += 1
-
-        feedback += f"{status} Q{i}: {user_ans} (Answer: {correct_letter} - {correct_value})\n"
-
+    for i, q in enumerate(questions, 1):
+        feedback += lines.get(i, f"❓ Q{i}: (not answered)\n")
         q_topic = q.get('_topic', student.get('current_topic', 'unknown'))
         stats = topic_stats.setdefault(q_topic, [0, 0])
         stats[1] += 1
-        if is_correct:
+        if correctness.get(i):
             stats[0] += 1
 
     score_percent = (correct / total * 100) if total > 0 else 0
@@ -607,8 +801,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     student = get_student(user_id)
     text = update.message.text
     
-    # Check if submitting answers
-    if 'Q' in text and ':' in text and ',' in text:
+    # Check if submitting answers (works for both "Q1: B, Q2: C" and a
+    # single-question "Q1: B" with no comma, and for essay answers)
+    if re.search(r'Q\s*\d+\s*:', text, re.I) and 'current_questions' in student:
         await submit_command(update, context)
         return
 
@@ -617,9 +812,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if intent.get('is_quiz_request'):
         count = intent.get('count') or 5
         count = max(1, min(int(count), 50))
+        qtype = str(intent.get('type', 'ABCD') or 'ABCD').upper()
+        if qtype not in ('ABCD', 'ESSAY'):
+            qtype = 'ABCD'
         topic_pairs = resolve_topics(intent.get('topics') or [])
         await update.message.reply_text(f"⏳ Generating {count} question(s)...")
-        await send_quiz(update, student, topic_pairs, count)
+        await send_quiz(update, student, topic_pairs, count, qtype=qtype)
         return
 
     # General chat with Claude
