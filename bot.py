@@ -15,6 +15,12 @@ import firebase_admin
 from firebase_admin import credentials, db
 
 # ============================================
+# CONFIG
+# ============================================
+
+DASHBOARD_URL = "https://mypalstutorbot-dashboard.vercel.app"
+
+# ============================================
 # INITIALIZE CLIENTS
 # ============================================
 
@@ -542,6 +548,7 @@ async def submit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     feedback += f"\n⭐ Stars Earned: +{stars_earned}"
     feedback += f"\n📊 Total Stars: {student['stars']}"
     feedback += f"\n🎖️ Level: {student['level']}"
+    feedback += f"\n\n📈 [Lihat progress lengkap kamu di dashboard]({DASHBOARD_URL})"
 
     # Push to Firebase so the web dashboard can show it
     save_progress_to_firebase(user_id, student)
@@ -565,6 +572,8 @@ async def score_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🥈 Silver: 100+ stars
 🥇 Gold: 300+ stars
 💎 Platinum: 500+ stars
+
+📈 [Lihat progress lengkap kamu di dashboard]({DASHBOARD_URL})
 """
     await update.message.reply_text(message, parse_mode='Markdown')
 
