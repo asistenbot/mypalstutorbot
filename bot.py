@@ -199,9 +199,9 @@ def generate_questions_claude(topic, count=5, language='english'):
     [
       {{
         "q": "Question text",
-        "a": "Correct answer",
+        "a": "The correct option's exact text, copied verbatim from one of the 4 items in options below (NOT a letter like A/B/C/D)",
         "type": "ABCD",
-        "options": ["A", "B", "C", "D"],
+        "options": ["first answer choice", "second answer choice", "third answer choice", "fourth answer choice"],
         "exp": "Explanation"
       }}
     ]
@@ -282,6 +282,31 @@ def score_answer(user_answer, correct_answer):
     user_ans = user_answer.strip().upper()
     correct_ans = correct_answer.strip().upper()
     return user_ans == correct_ans
+
+def get_correct_answer_info(question):
+    """Work out the correct option LETTER (and its text) for a question.
+
+    Questions from Firebase store q['a'] as the correct answer's TEXT
+    (e.g. "3/4"), matching one of the 4 items in q['options']. Questions
+    generated live by Claude sometimes instead return q['a'] as a bare
+    letter (A/B/C/D). This handles both shapes so scoring never mismatches
+    a letter against a value (or vice versa).
+    """
+    raw = str(question.get('a', '')).strip()
+    options = question.get('options', [])
+
+    # Case 1: 'a' is the answer's text - find which option it matches
+    for idx, opt in enumerate(options):
+        if str(opt).strip().upper() == raw.upper():
+            return chr(65 + idx), str(opt)
+
+    # Case 2: 'a' is already a bare letter A-D
+    if raw.upper() in ('A', 'B', 'C', 'D') and len(options) == 4:
+        idx = ord(raw.upper()) - 65
+        return raw.upper(), str(options[idx])
+
+    # Fallback: couldn't resolve against options, just return what we have
+    return raw.upper(), raw
 
 async def send_quiz(update, student, topic_pairs, count):
     """Build a quiz across one or more (subject, topic) pairs, splitting count between them,
@@ -482,15 +507,15 @@ async def submit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     topic_stats = {}  # topic -> [correct_count, total_count], since a quiz can span several topics
 
     for i, q in enumerate(student['current_questions'], 1):
-        correct_ans = q.get('a', '').upper()
+        correct_letter, correct_value = get_correct_answer_info(q)
         user_ans = answers.get(i, '❌').upper()
-        is_correct = score_answer(user_ans, correct_ans)
+        is_correct = score_answer(user_ans, correct_letter)
 
         status = "✅" if is_correct else "❌"
         if is_correct:
             correct += 1
 
-        feedback += f"{status} Q{i}: {user_ans} (Answer: {correct_ans})\n"
+        feedback += f"{status} Q{i}: {user_ans} (Answer: {correct_letter} - {correct_value})\n"
 
         q_topic = q.get('_topic', student.get('current_topic', 'unknown'))
         stats = topic_stats.setdefault(q_topic, [0, 0])
