@@ -811,6 +811,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     intent = detect_quiz_intent(text)
     if intent.get('is_quiz_request'):
         count = intent.get('count') or 5
+        # A bare trailing number in the message (e.g. "soal ratio 2") is a much
+        # more reliable count signal than the AI's own extraction, which can
+        # misread that pattern and fall back to its "default to 5" instruction.
+        # Trust the explicit number when there is one.
+        tokens = text.strip().split()
+        if tokens and tokens[-1].isdigit():
+            count = int(tokens[-1])
         count = max(1, min(int(count), 50))
         qtype = str(intent.get('type', 'ABCD') or 'ABCD').upper()
         if qtype not in ('ABCD', 'ESSAY'):
